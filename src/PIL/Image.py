@@ -41,26 +41,13 @@ import warnings
 from collections.abc import Callable, Iterator, MutableMapping, Sequence
 from enum import IntEnum
 from types import ModuleType
-from typing import (
-    IO,
-    TYPE_CHECKING,
-    Any,
-    Literal,
-    Protocol,
-    cast,
-)
+from typing import IO, TYPE_CHECKING, Any, Literal, Protocol, Tuple, cast
 
 # VERSION was removed in Pillow 6.0.0.
 # PILLOW_VERSION was removed in Pillow 9.0.0.
 # Use __version__ instead.
-from . import (
-    ExifTags,
-    ImageMode,
-    TiffTags,
-    UnidentifiedImageError,
-    __version__,
-    _plugins,
-)
+from . import (ExifTags, Image, ImageMode, TiffTags, UnidentifiedImageError,
+               __version__, _imagingmath, _plugins)
 from ._binary import i32le, o32be, o32le
 from ._deprecate import deprecate
 from ._util import DeferredError, is_path
@@ -224,7 +211,8 @@ if TYPE_CHECKING:
 
     from IPython.lib.pretty import PrettyPrinter
 
-    from . import ImageFile, ImageFilter, ImagePalette, ImageQt, TiffImagePlugin
+    from . import (ImageFile, ImageFilter, ImagePalette, ImageQt,
+                   TiffImagePlugin)
     from ._typing import CapsuleType, NumpyArray, StrOrBytesPath, TypeGuard
 ID: list[str] = []
 OPEN: dict[
@@ -603,16 +591,24 @@ class Image:
     def __enter__(self):
         return self
 
-    def __exit__(self, *args):
-        from . import ImageFile
+    def _close_fp(self):
+        if getattr(self, "_fp", False):
+            if self._fp != self.fp:
+                self._fp.close()
+            self._fp = DeferredError(ValueError("Operation on closed image"))
+        if self.fp:
+            self.fp.close()
 
-        if isinstance(self, ImageFile.ImageFile):
+    def __exit__(self, *args):
+        if hasattr(self, "fp"):
             if getattr(self, "_exclusive_fp", False):
                 self._close_fp()
             self.fp = None
 
     def close(self) -> None:
         """
+        Closes the file pointer, if possible.
+
         This operation will destroy the image core and release its memory.
         The image data will be unusable afterward.
 
@@ -621,6 +617,13 @@ class Image:
         :py:meth:`~PIL.Image.Image.load` method. See :ref:`file-handling` for
         more information.
         """
+        if hasattr(self, "fp"):
+            try:
+                self._close_fp()
+                self.fp = None
+            except Exception as msg:
+                logger.debug("Error closing: %s", msg)
+
         if getattr(self, "map", None):
             self.map: mmap.mmap | None = None
 
@@ -1539,10 +1542,50 @@ class Image:
         self.getexif()
 
     def get_child_images(self) -> list[ImageFile.ImageFile]:
-        from . import ImageFile
+        child_images = []
+        exif = self.getexif()
+        ifds = []
+        if ExifTags.Base.SubIFDs in exif:
+            subifd_offsets = exif[ExifTags.Base.SubIFDs]
+            if subifd_offsets:
+                if not isinstance(subifd_offsets, tuple):
+                    subifd_offsets = (subifd_offsets,)
+                for subifd_offset in subifd_offsets:
+                    ifds.append((exif._get_ifd_dict(subifd_offset), subifd_offset))
+        ifd1 = exif.get_ifd(ExifTags.IFD.IFD1)
+        if ifd1 and ifd1.get(ExifTags.Base.JpegIFOffset):
+            assert exif._info is not None
+            ifds.append((ifd1, exif._info.next))
 
-        deprecate("Image.Image.get_child_images", 13)
-        return ImageFile.ImageFile.get_child_images(self)  # type: ignore[arg-type]
+        offset = None
+        for ifd, ifd_offset in ifds:
+            current_offset = self.fp.tell()
+            if offset is None:
+                offset = current_offset
+
+            fp = self.fp
+            if ifd is not None:
+                thumbnail_offset = ifd.get(ExifTags.Base.JpegIFOffset)
+                if thumbnail_offset is not None:
+                    thumbnail_offset += getattr(self, "_exif_offset", 0)
+                    self.fp.seek(thumbnail_offset)
+                    data = self.fp.read(ifd.get(ExifTags.Base.JpegIFByteCount))
+                    fp = io.BytesIO(data)
+
+            with open(fp) as im:
+                from . import TiffImagePlugin
+
+                if thumbnail_offset is None and isinstance(
+                    im, TiffImagePlugin.TiffImageFile
+                ):
+                    im._frame_pos = [ifd_offset]
+                    im._seek(0)
+                im.load()
+                child_images.append(im)
+
+        if offset is not None:
+            self.fp.seek(offset)
+        return child_images
 
     def getim(self) -> CapsuleType:
         """
@@ -1550,7 +1593,6 @@ class Image:
 
         :returns: A capsule object.
         """
-
         self.load()
         return self.im.ptr
 
@@ -3044,7 +3086,7 @@ def new(
        None, the image is not initialised.
     :returns: An :py:class:`~PIL.Image.Image` object.
     """
-
+    
     if mode in ("BGR;15", "BGR;16", "BGR;24"):
         deprecate(mode, 12)
 
@@ -3055,10 +3097,7 @@ def new(
         return Image()._new(core.new(mode, size))
 
     if isinstance(color, str):
-        # css3-style specifier
-
-        from . import ImageColor
-
+        from src.PIL import ImageColor
         color = ImageColor.getcolor(color, mode)
 
     im = Image()
@@ -3067,13 +3106,12 @@ def new(
         and isinstance(color, (list, tuple))
         and all(isinstance(i, int) for i in color)
     ):
-        color_ints: tuple[int, ...] = cast(tuple[int, ...], tuple(color))
+        color_ints: Tuple[int, ...] = tuple(color)
         if len(color_ints) == 3 or len(color_ints) == 4:
-            # RGB or RGBA value for a P image
-            from . import ImagePalette
-
+            from src.PIL import ImagePalette
             im.palette = ImagePalette.ImagePalette()
             color = im.palette.getcolor(color_ints)
+    
     return im._new(core.fill(mode, size, color))
 
 

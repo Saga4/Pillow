@@ -20,7 +20,9 @@ import builtins
 from types import CodeType
 from typing import Any, Callable
 
-from . import Image, _imagingmath
+from . import Image, ImageColor, ImagePalette
+from . import _imaging as core
+from . import _imagingmath
 from ._deprecate import deprecate
 
 
@@ -34,16 +36,17 @@ class _Operand:
         # convert image to suitable mode
         if isinstance(im1, _Operand):
             # argument was an image.
-            if im1.im.mode in ("1", "L"):
+            mode = im1.im.mode
+            if mode in ("1", "L"):
                 return im1.im.convert("I")
-            elif im1.im.mode in ("I", "F"):
+            elif mode in ("I", "F"):
                 return im1.im
             else:
-                msg = f"unsupported mode: {im1.im.mode}"
-                raise ValueError(msg)
+                raise ValueError(f"unsupported mode: {mode}")
         else:
             # argument was a constant
-            if isinstance(im1, (int, float)) and self.im.mode in ("1", "L", "I"):
+            mode = self.im.mode
+            if isinstance(im1, (int, float)) and mode in ("1", "L", "I"):
                 return Image.new("I", self.im.size, im1)
             else:
                 return Image.new("F", self.im.size, im1)
@@ -56,41 +59,39 @@ class _Operand:
         mode: str | None = None,
     ) -> _Operand:
         im_1 = self.__fixup(im1)
+        
+        try:
+            op_func = getattr(_imagingmath, f"{op}_{im_1.mode}")
+        except AttributeError as e:
+            raise TypeError(f"bad operand type for '{op}'") from e
+            
         if im2 is None:
             # unary operation
             out = Image.new(mode or im_1.mode, im_1.size, None)
-            try:
-                op = getattr(_imagingmath, f"{op}_{im_1.mode}")
-            except AttributeError as e:
-                msg = f"bad operand type for '{op}'"
-                raise TypeError(msg) from e
-            _imagingmath.unop(op, out.getim(), im_1.getim())
+            _imagingmath.unop(op_func, out.getim(), im_1.getim())
         else:
             # binary operation
             im_2 = self.__fixup(im2)
+            
             if im_1.mode != im_2.mode:
-                # convert both arguments to floating point
                 if im_1.mode != "F":
                     im_1 = im_1.convert("F")
                 if im_2.mode != "F":
                     im_2 = im_2.convert("F")
-            if im_1.size != im_2.size:
-                # crop both arguments to a common size
-                size = (
-                    min(im_1.size[0], im_2.size[0]),
-                    min(im_1.size[1], im_2.size[1]),
-                )
-                if im_1.size != size:
+
+            im_1_size = im_1.size
+            im_2_size = im_2.size
+            if im_1_size != im_2_size:
+                min_width, min_height = min(im_1_size[0], im_2_size[0]), min(im_1_size[1], im_2_size[1])
+                size = (min_width, min_height)
+                if im_1_size != size:
                     im_1 = im_1.crop((0, 0) + size)
-                if im_2.size != size:
+                if im_2_size != size:
                     im_2 = im_2.crop((0, 0) + size)
-            out = Image.new(mode or im_1.mode, im_1.size, None)
-            try:
-                op = getattr(_imagingmath, f"{op}_{im_1.mode}")
-            except AttributeError as e:
-                msg = f"bad operand type for '{op}'"
-                raise TypeError(msg) from e
-            _imagingmath.binop(op, out.getim(), im_1.getim(), im_2.getim())
+                    
+            out = Image.new(mode or im_1.mode, size, None)
+            _imagingmath.binop(op_func, out.getim(), im_1.getim(), im_2.getim())
+            
         return _Operand(out)
 
     # unary operators
